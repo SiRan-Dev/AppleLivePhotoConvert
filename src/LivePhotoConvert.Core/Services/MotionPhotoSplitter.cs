@@ -78,10 +78,11 @@ public sealed class MotionPhotoSplitter(IMetadataService metadata, IImageConvert
                 }
 
                 var directory = request.Output.DirectoryFor(path);
+                var notes = new List<OutcomeNote>();
                 var outputs = request.Target == SplitTarget.Apple
-                    ? await RestoreAppleAsync(path, video, directory, request.HeicQuality, tags![path], committer, workspace, token)
+                    ? await RestoreAppleAsync(path, layout, directory, request.HeicQuality, tags![path], committer, workspace, notes, token)
                     : await ExtractAsync(path, video, directory, committer, token);
-                return ItemOutcome.Succeeded(path, outputs) with { CleanupError = disposition.Apply(path) };
+                return ItemOutcome.Succeeded(path, outputs) with { CleanupError = disposition.Apply(path), Notes = notes };
             },
             request.Parallelism,
             progress,
@@ -115,14 +116,16 @@ public sealed class MotionPhotoSplitter(IMetadataService metadata, IImageConvert
 
     private async Task<IReadOnlyList<string>> RestoreAppleAsync(
         string path,
-        EmbeddedVideo video,
+        ImageLayout layout,
         string directory,
         int heicQuality,
         MediaMetadata sourceTags,
         OutputCommitter committer,
         TempWorkspace workspace,
+        List<OutcomeNote> notes,
         CancellationToken cancellationToken)
     {
+        var video = layout.Video!;
         var (photoExtension, videoExtension) = DetectExtensions(path, video);
         var cover = workspace.NewFile(photoExtension);
         var embeddedVideo = workspace.NewFile(videoExtension);
@@ -131,7 +134,8 @@ public sealed class MotionPhotoSplitter(IMetadataService metadata, IImageConvert
         try
         {
             await BinaryFile.CopySegmentAsync(path, cover, 0, video.ImageEnd, cancellationToken);
-            await metadata.RemoveMotionPhotoAsync(cover, cancellationToken);
+            // 清掉安卓声明：封面已不带增益图，留着 Container/hdrgm 声明会让 iOS 按 HDR 渲染而发灰
+            await metadata.RemoveAndroidDeclarationsAsync(cover, cancellationToken);
             if (photoExtension.Equals(".heic", StringComparison.OrdinalIgnoreCase))
             {
                 File.Copy(cover, stagedPhoto);
@@ -142,11 +146,18 @@ public sealed class MotionPhotoSplitter(IMetadataService metadata, IImageConvert
             }
 
             await BinaryFile.CopySegmentAsync(path, embeddedVideo, video.Offset, video.Length, cancellationToken);
-            await videoConverter!.RemuxToMovAsync(embeddedVideo, stagedVideo, cancellationToken: cancellationToken);
+            // 苹果实况视频是 SDR：保留安卓的 HDR 标记会让 iOS 在调整封面时按错误曲线渲染视频帧而发灰
+            await videoConverter!.RemuxToMovAsync(embeddedVideo, stagedVideo, new VideoConversionOptions { ToneMapToSdr = true }, cancellationToken);
 
             var contentIdentifier = Guid.NewGuid().ToString().ToUpperInvariant();
             await metadata.WriteApplePhotoIdentifierAsync(stagedPhoto, contentIdentifier, cancellationToken);
             await metadata.WriteAppleVideoTagsAsync(stagedVideo, AppleVideoTags.From(contentIdentifier, sourceTags), cancellationToken);
+
+            // 封面时间轨道必须在标签写完之后加：ExifTool 重写文件时会把 moov 移到 mdat 之前，轨道里的块偏移随之失效
+            if (await MovStillImageTrack.AddAsync(stagedVideo, layout.PresentationTimestampUs ?? 0, cancellationToken) == StillImageTrackResult.Unsupported)
+            {
+                notes.Add(new OutcomeNote(OutcomeNoteKind.StillImageTrackUnavailable));
+            }
 
             var stem = Path.GetFileNameWithoutExtension(path);
             return committer.CommitGroup(
